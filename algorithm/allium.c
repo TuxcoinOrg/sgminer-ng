@@ -26,7 +26,7 @@ be32enc_vect(uint32_t *dst, const uint32_t *src, uint32_t len)
 }
 
 
-void allium_rehash(void *state, const void *input)
+void scanhash_allium(void *state, const void *input)
 {
     sph_blake256_context     ctx_blake;
     sph_groestl256_context   ctx_groestl;
