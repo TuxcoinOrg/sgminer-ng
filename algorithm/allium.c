@@ -26,7 +26,7 @@ be32enc_vect(uint32_t *dst, const uint32_t *src, uint32_t len)
 }
 
 
-void scanhash_allium(void *state, const void *input)
+void allium_rehash(void *state, const void *input)
 {
     sph_blake256_context     ctx_blake;
     sph_groestl256_context   ctx_groestl;
@@ -100,7 +100,7 @@ void allium_regenhash(struct work *work)
         allium_rehash(ohash, data);
 }
 
-bool allium_lyra2re(struct thr_info *thr, const unsigned char __maybe_unused *pmidstate,
+bool scanhash_allium(struct thr_info *thr, const unsigned char __maybe_unused *pmidstate,
 		     unsigned char *pdata, unsigned char __maybe_unused *phash1,
 		     unsigned char __maybe_unused *phash, const unsigned char *ptarget,
 		     uint32_t max_nonce, uint32_t *last_nonce, uint32_t n)
