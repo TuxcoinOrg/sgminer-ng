@@ -285,11 +285,10 @@ barrier(CLK_LOCAL_MEM_FENCE);
 // cubehash256
 
 __attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
-__kernel void search3(__global uchar* hashes)
+__kernel void search3(__global hash_t* hashes)
 {
 	uint gid = get_global_id(0);
-	__global hash_t *hash = (__global hash_t *)(hashes + (4 * sizeof(ulong)* (get_global_id(0) % MAX_GLOBAL_THREADS)));
-
+    __global hash_t *hash = &(hashes[gid-get_global_offset(0)]);
 
 	sph_u32 x0 = 0xEA2BD4B4; sph_u32 x1 = 0xCCD6F29F; sph_u32 x2 = 0x63117E71;
 	sph_u32 x3 = 0x35481EAE; sph_u32 x4 = 0x22512D5B; sph_u32 x5 = 0xE5D94E63;
