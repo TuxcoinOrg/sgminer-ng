@@ -948,15 +948,35 @@ static cl_int queue_allium_kernel(struct __clState *clState, struct _dev_blk_ctx
   // keccak - search1
   kernel = clState->extra_kernels;
   CL_SET_ARG_0(clState->padbuffer8);
-  // lyra2 - search2
+  // lyra2p1 - search2
+  num = 0;
   CL_NEXTKERNEL_SET_ARG_0(clState->padbuffer8);
-  // cubehash - search3
+  CL_SET_ARG_N(1, clState->buffer1);
+  // lyra2p2 - search3
+  num = 0;
+  CL_NEXTKERNEL_SET_ARG_0(clState->buffer1);
+  // lyra2p3 - search4
+  num = 0;
   CL_NEXTKERNEL_SET_ARG_0(clState->padbuffer8);
-  // lyra2 - search4
+  CL_SET_ARG_N(1, clState->buffer1);
+  // cubehash - search5
+  num = 0;
   CL_NEXTKERNEL_SET_ARG_0(clState->padbuffer8);
-  // skein - search5
+  // lyra2p1 - search6
+  num = 0;
   CL_NEXTKERNEL_SET_ARG_0(clState->padbuffer8);
-  // groestl - search6
+  CL_SET_ARG_N(1, clState->buffer1);
+  // lyra2p2 - search7
+  num = 0;
+  CL_NEXTKERNEL_SET_ARG_0(clState->buffer1);
+  // lyra2p3 - search8
+  num = 0;
+  CL_NEXTKERNEL_SET_ARG_0(clState->padbuffer8);
+  CL_SET_ARG_N(1, clState->buffer1);
+  // skein - search9
+  num = 0;
+  CL_NEXTKERNEL_SET_ARG_0(clState->padbuffer8);
+  // groestl - search10
   num = 0;
   CL_NEXTKERNEL_SET_ARG(clState->padbuffer8);
   CL_SET_ARG(clState->outputBuffer);
@@ -1324,7 +1344,7 @@ static algorithm_settings_t algos[] = {
   { "lyra2re", ALGO_LYRA2RE, "", 1, 128, 128, 0, 0, 0xFF, 0xFFFFULL, 0x0000ffffUL, 4, 2 * 8 * 4194304, 0, lyra2re_regenhash, precalc_hash_blake256, queue_lyra2re_kernel, gen_hash, NULL },
   { "lyra2rev2", ALGO_LYRA2REV2, "", 1, 256, 256, 0, 0, 0xFF, 0xFFFFULL, 0x0000ffffUL, 6, -1, CL_QUEUE_OUT_OF_ORDER_EXEC_MODE_ENABLE, lyra2rev2_regenhash, precalc_hash_blake256, queue_lyra2rev2_kernel, gen_hash, append_neoscrypt_compiler_options },
 
-  { "allium", ALGO_ALLIUM, "", 1, 128, 128, 0, 0, 0xFF, 0xFFFFULL, 0x0000ffffUL, 6, 2 * 8 * 4194304, 0, allium_regenhash, precalc_hash_blake256, queue_allium_kernel, gen_hash, NULL },
+  { "allium", ALGO_ALLIUM, "", 1, 128, 128, 0, 0, 0xFF, 0xFFFFULL, 0x0000ffffUL, 10, 512 * 4194304, 0, allium_regenhash, precalc_hash_blake256, queue_allium_kernel, gen_hash, NULL },
 
   // kernels starting from this will have difficulty calculated by using fuguecoin algorithm
 #define A_FUGUE(a, b, c) \

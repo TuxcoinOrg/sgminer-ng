@@ -88,13 +88,13 @@ static inline sph_u64 ror64(sph_u64 vw, unsigned a) {
 
 #include "blake256.cl"
 #include "groestl256.cl"
-#include "lyra2.cl"
 #include "cubehash.cl"
 #include "keccak1600.cl"
 #include "skein256.cl"
 
 #define SWAP4(x) as_uint(as_uchar4(x).wzyx)
 #define SWAP8(x) as_ulong(as_uchar8(x).s76543210)
+#define SWAP32(x) as_ulong(as_uint2(x).s10)
 
 #if SPH_BIG_ENDIAN
   #define DEC64E(x) (x)
@@ -113,6 +113,24 @@ typedef union {
   uint h4[16];
   ulong h8[8];
 } hash_t;
+
+typedef union {
+    uint h4[8];
+    ulong h8[4];
+    uint4 h16[2];
+    ulong2 hl16[2];
+    ulong4 h32;
+} hash2_t;
+
+typedef union {
+    uint h4[32];
+    ulong h8[16];
+    uint4 h16[8];
+    ulong2 hl16[8];
+    ulong4 h32[4];
+} lyraState_t;
+
+#include "lyra2mdz.cl"
 
 __attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
 __kernel void search(
@@ -213,79 +231,162 @@ barrier(CLK_LOCAL_MEM_FENCE);
 
 }
 
-/// lyra2 algo 
+/// lyra2 p1 
 
 __attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
-__kernel void search2(__global hash_t* hashes)
+__kernel void search2(__global uint* hashes, __global uchar* sharedDataBuf)
 {
- uint gid = get_global_id(0);
-  __global hash_t *hash = &(hashes[gid-get_global_offset(0)]);
+    int gid = get_global_id(0);
 
-  uint2 state[16];
+    __global hash2_t *hash = (__global hash2_t *)(hashes + (8* (gid-get_global_offset(0))));
+    __global lyraState_t *lyraState = (__global lyraState_t *)(sharedDataBuf + ((8 * 4  * 4) * (gid-get_global_offset(0))));
 
-  for (int i = 0; i < 4; i++) { state[i] = as_uint2(hash->h8[i]);} //password
-  for (int i = 0; i < 4; i++) { state[i + 4] = state[i]; } //salt 
-  for (int i = 0; i < 8; i++) { state[i + 8] = as_uint2(blake2b_IV[i]); }
+    ulong ttr;
 
-  //     blake2blyra x2 
+    ulong2 state[8];
+    // state0
+    state[0] = hash->hl16[0];
+    state[1] = hash->hl16[1];
+    // state1
+    state[2] = state[0];
+    state[3] = state[1];
+    // state2
+    state[4] = (ulong2)(0x6a09e667f3bcc908UL, 0xbb67ae8584caa73bUL);
+    state[5] = (ulong2)(0x3c6ef372fe94f82bUL, 0xa54ff53a5f1d36f1UL);
+    // state3 (low,high,..
+    state[6] = (ulong2)(0x510e527fade682d1UL, 0x9b05688c2b3e6c1fUL);
+    state[7] = (ulong2)(0x1f83d9abfb41bd6bUL, 0x5be0cd19137e2179UL);
 
-  for (int i = 0; i < 24; i++) {round_lyra(state);} //because 12 is not enough
+    // Absorbing salt, password and basil: this is the only place in which the block length is hard-coded to 512 bits
+    for (int i = 0; i < 24; ++i)
+    {
+        roundLyra(state);
+    }
 
-  __private uint2 Matrix[96][8]; // very uncool
-  /// reducedSqueezeRow0
+    // state0
+    lyraState->hl16[0] = state[0];
+    lyraState->hl16[1] = state[1];
+    // state1
+    lyraState->hl16[2] = state[2];
+    lyraState->hl16[3] = state[3];
+    // state2
+    lyraState->hl16[4] = state[4];
+    lyraState->hl16[5] = state[5];
+    // state3
+    lyraState->hl16[6] = state[6];
+    lyraState->hl16[7] = state[7];
 
-  for (int i = 0; i < 8; i++)
-  {
-	  for (int j = 0; j<12; j++) {Matrix[j + 84 - 12 * i][0] = state[j];}
-	  round_lyra(state);
+    barrier(CLK_GLOBAL_MEM_FENCE);
+}
+
+/// lyra2 algo p2 
+
+__attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
+__kernel void search3(__global uchar* sharedDataBuf)
+{
+  uint gid = get_global_id(1);
+  __global lyraState_t *lyraState = (__global lyraState_t *)(sharedDataBuf + ((8 * 4  * 4) * (gid-get_global_offset(1))));
+
+  __local ulong roundPad[12 * 5];
+  __local ulong *xchange = roundPad + get_local_id(1) * 4;
+
+  //__global ulong *notepad = buffer + get_local_id(0) + 4 * SLOT;
+  __local ulong notepadLDS[192 * 4 * 5];
+  __local ulong *notepad = notepadLDS + LOCAL_LINEAR;
+  const int player = get_local_id(0);
+
+  ulong state[4];
+
+  //-------------------------------------
+  // Load Lyra state
+  state[0] = (ulong)(lyraState->h8[player]);
+  state[1] = (ulong)(lyraState->h8[player+4]);
+  state[2] = (ulong)(lyraState->h8[player+8]);
+  state[3] = (ulong)(lyraState->h8[player+12]);
+  
+  __local ulong *dst = notepad + HYPERMATRIX_COUNT;
+  for (int loop = 0; loop < LYRA_ROUNDS; loop++) { // write columns and rows 'in order'
+    dst -= STATE_BLOCK_COUNT; // but blocks backwards
+    for(int cp = 0; cp < 3; cp++) dst[cp * REG_ROW_COUNT] = state[cp];
+    round_lyra_4way(state, xchange);
   }
+  make_hyper_one(state, xchange, notepad);
+  make_next_hyper(1, 0, 2, state, roundPad, notepad);
+  make_next_hyper(2, 1, 3, state, roundPad, notepad);
+  make_next_hyper(3, 0, 4, state, roundPad, notepad);
+  make_next_hyper(4, 3, 5, state, roundPad, notepad);
+  make_next_hyper(5, 2, 6, state, roundPad, notepad);
+  make_next_hyper(6, 1, 7, state, roundPad, notepad);
 
-  /// reducedSqueezeRow1
+  uint modify;
+  uint row = 0;
+  uint pre = 7;
 
-  for (int i = 0; i < 8; i++)
-  {
-	  for (int j = 0; j < 12; j++) {state[j] ^= Matrix[j + 12 * i][0];}
-	  round_lyra(state);
-	  for (int j = 0; j < 12; j++) {Matrix[j + 84 - 12 * i][1] = Matrix[j + 12 * i][0] ^ state[j];}
+  __local uint *shorter = (__local uint*)roundPad;
+  for (int i = 0; i < LYRA_ROUNDS; i++) {
+    if(get_local_id(0) == 0) {
+      shorter[get_local_id(1)] = (uint)(state[0] % 8);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE); // nop
+    modify = shorter[get_local_id(1)];
+    hyper_xor(pre, modify, row, state, roundPad, notepad);
+    pre = row;
+    row = (row + 3) % 8;
   }
- 
-  reduceDuplexRowSetup(1, 0, 2);
-  reduceDuplexRowSetup(2, 1, 3);
-  reduceDuplexRowSetup(3, 0, 4);
-  reduceDuplexRowSetup(4, 3, 5);
-  reduceDuplexRowSetup(5, 2, 6);
-  reduceDuplexRowSetup(6, 1, 7);
+  
+  notepad += HYPERMATRIX_COUNT * modify;
+  for(int loop = 0; loop < 3; loop++) state[loop] ^= notepad[loop * REG_ROW_COUNT];
 
-  sph_u32 rowa;
-  rowa = state[0].x & 7;
+  //-------------------------------------
+  // save lyra state    
+  lyraState->h8[player] = state[0];
+  lyraState->h8[player+4] = state[1];
+  lyraState->h8[player+8] = state[2];
+  lyraState->h8[player+12] = state[3];
 
-  reduceDuplexRow(7, rowa, 0);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(0, rowa, 3);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(3, rowa, 6);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(6, rowa, 1);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(1, rowa, 4);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(4, rowa, 7);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(7, rowa, 2);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(2, rowa, 5);
+  barrier(CLK_GLOBAL_MEM_FENCE);
+}
 
-  absorbblock(rowa);
+// lyra2 p3
 
-  for (int i = 0; i < 4; i++) {hash->h8[i] = as_ulong(state[i]);} 
-barrier(CLK_LOCAL_MEM_FENCE);
+__attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
+__kernel void search4(__global uint* hashes, __global uchar* sharedDataBuf)
+{
+    int gid = get_global_id(0);
 
+    __global hash2_t *hash = (__global hash2_t *)(hashes + (8* (gid-get_global_offset(0))));
+    __global lyraState_t *lyraState = (__global lyraState_t *)(sharedDataBuf + ((8 * 4  * 4) * (gid-get_global_offset(0))));
+
+    ulong ttr;
+
+    ulong2 state[8];
+    // 1. load lyra State
+    state[0] = lyraState->hl16[0];
+    state[1] = lyraState->hl16[1];
+    state[2] = lyraState->hl16[2];
+    state[3] = lyraState->hl16[3];
+    state[4] = lyraState->hl16[4];
+    state[5] = lyraState->hl16[5];
+    state[6] = lyraState->hl16[6];
+    state[7] = lyraState->hl16[7];
+
+    // 2. rounds
+    for (int i = 0; i < 12; ++i)
+    {
+        roundLyra(state);
+    }
+
+    // 3. store result
+    hash->hl16[0] = state[0];
+    hash->hl16[1] = state[1];
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
 }
 
 // cubehash256
 
 __attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
-__kernel void search3(__global hash_t* hashes)
+__kernel void search5(__global hash_t* hashes)
 {
 	uint gid = get_global_id(0);
     __global hash_t *hash = &(hashes[gid-get_global_offset(0)]);
@@ -334,79 +435,163 @@ __kernel void search3(__global hash_t* hashes)
 
 }
 
-/// lyra2 algo 
+/// lyra2 p1 
 
 __attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
-__kernel void search4(__global hash_t* hashes)
+__kernel void search6(__global uint* hashes, __global uchar* sharedDataBuf)
 {
- uint gid = get_global_id(0);
-  __global hash_t *hash = &(hashes[gid-get_global_offset(0)]);
+    int gid = get_global_id(0);
 
-  uint2 state[16];
+    __global hash2_t *hash = (__global hash2_t *)(hashes + (8* (gid-get_global_offset(0))));
+    __global lyraState_t *lyraState = (__global lyraState_t *)(sharedDataBuf + ((8 * 4  * 4) * (gid-get_global_offset(0))));
 
-  for (int i = 0; i < 4; i++) { state[i] = as_uint2(hash->h8[i]);} //password
-  for (int i = 0; i < 4; i++) { state[i + 4] = state[i]; } //salt 
-  for (int i = 0; i < 8; i++) { state[i + 8] = as_uint2(blake2b_IV[i]); }
+    ulong ttr;
 
-  //     blake2blyra x2 
+    ulong2 state[8];
+    // state0
+    state[0] = hash->hl16[0];
+    state[1] = hash->hl16[1];
+    // state1
+    state[2] = state[0];
+    state[3] = state[1];
+    // state2
+    state[4] = (ulong2)(0x6a09e667f3bcc908UL, 0xbb67ae8584caa73bUL);
+    state[5] = (ulong2)(0x3c6ef372fe94f82bUL, 0xa54ff53a5f1d36f1UL);
+    // state3 (low,high,..
+    state[6] = (ulong2)(0x510e527fade682d1UL, 0x9b05688c2b3e6c1fUL);
+    state[7] = (ulong2)(0x1f83d9abfb41bd6bUL, 0x5be0cd19137e2179UL);
 
-  for (int i = 0; i < 24; i++) {round_lyra(state);} //because 12 is not enough
+    // Absorbing salt, password and basil: this is the only place in which the block length is hard-coded to 512 bits
+    for (int i = 0; i < 24; ++i)
+    {
+        roundLyra(state);
+    }
 
-  __private uint2 Matrix[96][8]; // very uncool
-  /// reducedSqueezeRow0
+    // state0
+    lyraState->hl16[0] = state[0];
+    lyraState->hl16[1] = state[1];
+    // state1
+    lyraState->hl16[2] = state[2];
+    lyraState->hl16[3] = state[3];
+    // state2
+    lyraState->hl16[4] = state[4];
+    lyraState->hl16[5] = state[5];
+    // state3
+    lyraState->hl16[6] = state[6];
+    lyraState->hl16[7] = state[7];
 
-  for (int i = 0; i < 8; i++)
-  {
-	  for (int j = 0; j<12; j++) {Matrix[j + 84 - 12 * i][0] = state[j];}
-	  round_lyra(state);
+    barrier(CLK_GLOBAL_MEM_FENCE);
+}
+
+/// lyra2 algo p2 
+
+
+__attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
+__kernel void search7(__global uchar* sharedDataBuf)
+{
+  uint gid = get_global_id(1);
+  __global lyraState_t *lyraState = (__global lyraState_t *)(sharedDataBuf + ((8 * 4  * 4) * (gid-get_global_offset(1))));
+
+  __local ulong roundPad[12 * 5];
+  __local ulong *xchange = roundPad + get_local_id(1) * 4;
+
+  //__global ulong *notepad = buffer + get_local_id(0) + 4 * SLOT;
+  __local ulong notepadLDS[192 * 4 * 5];
+  __local ulong *notepad = notepadLDS + LOCAL_LINEAR;
+  const int player = get_local_id(0);
+
+  ulong state[4];
+
+  //-------------------------------------
+  // Load Lyra state
+  state[0] = (ulong)(lyraState->h8[player]);
+  state[1] = (ulong)(lyraState->h8[player+4]);
+  state[2] = (ulong)(lyraState->h8[player+8]);
+  state[3] = (ulong)(lyraState->h8[player+12]);
+  
+  __local ulong *dst = notepad + HYPERMATRIX_COUNT;
+  for (int loop = 0; loop < LYRA_ROUNDS; loop++) { // write columns and rows 'in order'
+    dst -= STATE_BLOCK_COUNT; // but blocks backwards
+    for(int cp = 0; cp < 3; cp++) dst[cp * REG_ROW_COUNT] = state[cp];
+    round_lyra_4way(state, xchange);
   }
+  make_hyper_one(state, xchange, notepad);
+  make_next_hyper(1, 0, 2, state, roundPad, notepad);
+  make_next_hyper(2, 1, 3, state, roundPad, notepad);
+  make_next_hyper(3, 0, 4, state, roundPad, notepad);
+  make_next_hyper(4, 3, 5, state, roundPad, notepad);
+  make_next_hyper(5, 2, 6, state, roundPad, notepad);
+  make_next_hyper(6, 1, 7, state, roundPad, notepad);
 
-  /// reducedSqueezeRow1
+  uint modify;
+  uint row = 0;
+  uint pre = 7;
 
-  for (int i = 0; i < 8; i++)
-  {
-	  for (int j = 0; j < 12; j++) {state[j] ^= Matrix[j + 12 * i][0];}
-	  round_lyra(state);
-	  for (int j = 0; j < 12; j++) {Matrix[j + 84 - 12 * i][1] = Matrix[j + 12 * i][0] ^ state[j];}
+  __local uint *shorter = (__local uint*)roundPad;
+  for (int i = 0; i < LYRA_ROUNDS; i++) {
+    if(get_local_id(0) == 0) {
+      shorter[get_local_id(1)] = (uint)(state[0] % 8);
+    }
+    barrier(CLK_LOCAL_MEM_FENCE); // nop
+    modify = shorter[get_local_id(1)];
+    hyper_xor(pre, modify, row, state, roundPad, notepad);
+    pre = row;
+    row = (row + 3) % 8;
   }
- 
-  reduceDuplexRowSetup(1, 0, 2);
-  reduceDuplexRowSetup(2, 1, 3);
-  reduceDuplexRowSetup(3, 0, 4);
-  reduceDuplexRowSetup(4, 3, 5);
-  reduceDuplexRowSetup(5, 2, 6);
-  reduceDuplexRowSetup(6, 1, 7);
+  
+  notepad += HYPERMATRIX_COUNT * modify;
+  for(int loop = 0; loop < 3; loop++) state[loop] ^= notepad[loop * REG_ROW_COUNT];
 
-  sph_u32 rowa;
-  rowa = state[0].x & 7;
+  //-------------------------------------
+  // save lyra state    
+  lyraState->h8[player] = state[0];
+  lyraState->h8[player+4] = state[1];
+  lyraState->h8[player+8] = state[2];
+  lyraState->h8[player+12] = state[3];
 
-  reduceDuplexRow(7, rowa, 0);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(0, rowa, 3);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(3, rowa, 6);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(6, rowa, 1);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(1, rowa, 4);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(4, rowa, 7);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(7, rowa, 2);
-  rowa = state[0].x & 7;
-  reduceDuplexRow(2, rowa, 5);
+  barrier(CLK_GLOBAL_MEM_FENCE);
+}
 
-  absorbblock(rowa);
+// lyra2 p3
 
-  for (int i = 0; i < 4; i++) {hash->h8[i] = as_ulong(state[i]);} 
-barrier(CLK_LOCAL_MEM_FENCE);
+__attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
+__kernel void search8(__global uint* hashes, __global uchar* sharedDataBuf)
+{
+    int gid = get_global_id(0);
 
+    __global hash2_t *hash = (__global hash2_t *)(hashes + (8* (gid-get_global_offset(0))));
+    __global lyraState_t *lyraState = (__global lyraState_t *)(sharedDataBuf + ((8 * 4  * 4) * (gid-get_global_offset(0))));
+
+    ulong ttr;
+
+    ulong2 state[8];
+    // 1. load lyra State
+    state[0] = lyraState->hl16[0];
+    state[1] = lyraState->hl16[1];
+    state[2] = lyraState->hl16[2];
+    state[3] = lyraState->hl16[3];
+    state[4] = lyraState->hl16[4];
+    state[5] = lyraState->hl16[5];
+    state[6] = lyraState->hl16[6];
+    state[7] = lyraState->hl16[7];
+
+    // 2. rounds
+    for (int i = 0; i < 12; ++i)
+    {
+        roundLyra(state);
+    }
+
+    // 3. store result
+    hash->hl16[0] = state[0];
+    hash->hl16[1] = state[1];
+    
+    barrier(CLK_GLOBAL_MEM_FENCE);
 }
 
 //skein256
 
 __attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
-__kernel void search5(__global hash_t* hashes)
+__kernel void search9(__global hash_t* hashes)
 {
  uint gid = get_global_id(0);
   __global hash_t *hash = &(hashes[gid-get_global_offset(0)]);
@@ -475,8 +660,9 @@ __kernel void search5(__global hash_t* hashes)
 
 }
 
+// groestl256
 __attribute__((reqd_work_group_size(WORKSIZE, 1, 1)))
-__kernel void search6(__global hash_t* hashes, __global uint* output, const ulong target)
+__kernel void search10(__global hash_t* hashes, __global uint* output, const ulong target)
 {
 // __local ulong T0[256], T1[256], T2[256], T3[256], T4[256], T5[256], T6[256], T7[256];
    // uint u   = get_local_id(0);
